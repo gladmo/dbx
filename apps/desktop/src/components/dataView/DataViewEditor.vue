@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, toRaw, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Plus, Trash2, Wand2, ChevronLeft, ChevronDown, ChevronRight, Eye, Loader2, AlertCircle, GripVertical } from "@lucide/vue";
+import { Plus, Trash2, Wand2, ChevronLeft, ChevronDown, ChevronRight, Eye, Loader2, AlertCircle, GripVertical, Pencil } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,6 +11,7 @@ import DataGrid from "@/components/grid/DataGrid.vue";
 import QueryChart from "@/components/chart/QueryChart.vue";
 import ConnectionTreeSelect from "@/components/connection/ConnectionTreeSelect.vue";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
+import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import { useDataViewStore } from "@/stores/dataViewStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
@@ -375,14 +376,14 @@ async function persistDraftForPreview(): Promise<DataView | null> {
   }
 }
 
-async function previewQuery(query: DataViewQuery) {
+async function doPreviewQuery(query: DataViewQuery, allowMutations: boolean) {
   if (previewBusy[query.id]) return;
   previewBusy[query.id] = true;
   previewError.value = null;
   try {
     const saved = await persistDraftForPreview();
     if (!saved) return;
-    const response = await store.execute(saved.id, buildPreviewPayload(), { queryIds: [query.id] });
+    const response = await store.execute(saved.id, buildPreviewPayload(), { queryIds: [query.id], allowMutations });
     const result = response.results.find((r) => r.queryId === query.id);
     if (result) previewResults[query.id] = result;
   } catch (error) {
@@ -397,6 +398,31 @@ async function previewQuery(query: DataViewQuery) {
   }
 }
 
+async function previewQuery(query: DataViewQuery) {
+  if ((query.kind ?? "query") === "mutation") {
+    requestPreviewMutation(query);
+    return;
+  }
+  await doPreviewQuery(query, false);
+}
+
+const pendingPreviewMutation = ref<DataViewQuery | null>(null);
+const previewMutationDialogOpen = ref(false);
+
+function requestPreviewMutation(query: DataViewQuery) {
+  if (previewBusy[query.id]) return;
+  pendingPreviewMutation.value = query;
+  previewMutationDialogOpen.value = true;
+}
+
+async function executePreviewMutation() {
+  const query = pendingPreviewMutation.value;
+  if (!query || previewBusy[query.id]) return;
+  previewMutationDialogOpen.value = false;
+  pendingPreviewMutation.value = null;
+  await doPreviewQuery(query, true);
+}
+
 async function previewView() {
   if (viewPreviewBusy.value) return;
   const readQueryIds = draft.queries.filter((q) => (q.kind ?? "query") !== "mutation").map((q) => q.id);
@@ -406,7 +432,7 @@ async function previewView() {
   try {
     const saved = await persistDraftForPreview();
     if (!saved) return;
-    const response = await store.execute(saved.id, buildPreviewPayload(), { queryIds: readQueryIds });
+    const response = await store.execute(saved.id, buildPreviewPayload(), { queryIds: readQueryIds, allowMutations: false });
     for (const result of response.results) previewResults[result.queryId] = result;
   } catch (error) {
     previewError.value = error instanceof Error ? error.message : String(error);
@@ -523,10 +549,11 @@ async function previewView() {
                   <SelectItem v-for="ct in chartTypes" :key="ct" :value="ct">{{ t(`chart.${ct}`) }}</SelectItem>
                 </SelectContent>
               </Select>
-              <Button size="sm" variant="ghost" class="ml-auto shrink-0" :disabled="previewBusy[query.id] || !query.connectionId" @click="previewQuery(query)">
+              <Button size="sm" :variant="query.kind === 'mutation' ? 'destructive' : 'ghost'" class="ml-auto shrink-0" :disabled="previewBusy[query.id] || !query.connectionId" @click="previewQuery(query)">
                 <Loader2 v-if="previewBusy[query.id]" class="mr-1 h-4 w-4 animate-spin" />
+                <Pencil v-else-if="query.kind === 'mutation'" class="mr-1 h-4 w-4" />
                 <Eye v-else class="mr-1 h-4 w-4" />
-                {{ t("dataView.preview") }}
+                {{ query.kind === "mutation" ? t("dataView.executeUpdate") : t("dataView.preview") }}
               </Button>
               <LightTooltip :text="collapsedQueries[query.id] ? t('dataView.expandQuery') : t('dataView.collapseQuery')" side="bottom">
                 <Button size="sm" variant="ghost" class="shrink-0 px-1" @click="toggleQueryCollapsed(query.id)">
@@ -598,5 +625,15 @@ async function previewView() {
         </div>
       </div>
     </div>
+
+    <DangerConfirmDialog
+      v-model:open="previewMutationDialogOpen"
+      :sql="pendingPreviewMutation?.sqlTemplate ?? ''"
+      :title="t('dataView.executeUpdate')"
+      :message="t('dataView.confirmUpdate', { name: pendingPreviewMutation?.title || t('dataView.untitledQuery') })"
+      :confirm-label="t('dataView.executeUpdate')"
+      :cancelable="true"
+      @confirm="executePreviewMutation"
+    />
   </div>
 </template>

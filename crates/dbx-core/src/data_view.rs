@@ -156,6 +156,62 @@ pub struct DataViewExecuteOptions {
     /// When set, only sub-queries with these ids run. Used to run reads and
     /// writes independently (mutations execute one at a time on demand).
     pub query_ids: Option<Vec<String>>,
+    /// When false, any query with `kind == "mutation"` is rejected. Callers
+    /// that have obtained explicit user confirmation (the Runner's destructive-
+    /// operation dialog, or the Editor's mutation-preview dialog) must set this
+    /// to true. This prevents the Editor's unconditional `previewQuery` path
+    /// from executing writes without confirmation.
+    pub allow_mutations: bool,
+}
+
+fn is_redis_write_command(command_text: &str) -> bool {
+    let trimmed = command_text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let argv = match crate::db::redis_driver::parse_command_argv(trimmed) {
+        Ok(argv) => argv,
+        Err(_) => {
+            // Fallback to the first whitespace-delimited token when the command
+            // cannot be parsed (e.g. an incomplete quote left by substitution).
+            let first = trimmed.split_whitespace().next().unwrap_or("").to_string();
+            vec![first]
+        }
+    };
+    let Some(cmd) = argv.first().map(|s| s.as_str()).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    !matches!(crate::db::redis_driver::classify_command(cmd), crate::db::redis_driver::RedisCommandSafety::Allowed)
+}
+
+fn is_write_sql_for_view(sql: &str, db_type: Option<DatabaseType>) -> bool {
+    match db_type {
+        Some(db_type) => crate::query_execution_sql::is_write_sql_for_database(sql, db_type),
+        None => crate::query_execution_sql::is_write_sql(sql),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn data_view_gate_error(
+    sql: &str,
+    db_type: Option<DatabaseType>,
+    is_redis: bool,
+    kind: &str,
+    allow_mutations: bool,
+) -> Option<String> {
+    let is_mutation_kind = kind == "mutation";
+    let is_write = if is_redis { is_redis_write_command(sql) } else { is_write_sql_for_view(sql, db_type) };
+    if is_write && !is_mutation_kind {
+        return Some(format!(
+            "Write operation requires mutation kind: query is declared as \"query\" but the SQL contains a write. Mark it as \"mutation\" and confirm before running."
+        ));
+    }
+    if is_mutation_kind && !allow_mutations {
+        return Some(
+            "Mutation requires explicit confirmation. Confirm the destructive operation before execution.".to_string(),
+        );
+    }
+    None
 }
 
 /// Runs every sub-query in `view` after substituting `values` into each
@@ -176,7 +232,8 @@ pub async fn execute_data_view(
     for query in queries {
         let display_mode = query.display_mode.clone().unwrap_or_else(|| view.default_display_mode.clone());
         let config = state.configs.read().await.get(&query.connection_id).cloned();
-        let is_redis = matches!(config.map(|c| c.db_type), Some(DatabaseType::Redis));
+        let db_type = config.as_ref().map(|c| c.db_type);
+        let is_redis = matches!(db_type, Some(DatabaseType::Redis));
         let dialect = if is_redis { SubstituteDialect::Redis } else { SubstituteDialect::Sql };
         let sql = match substitute(&query.sql_template, &view.variables, values, dialect) {
             Ok(sql) => sql,
@@ -192,6 +249,44 @@ pub async fn execute_data_view(
                 continue;
             }
         };
+
+        // ---- Execution-boundary write semantics ----
+        // 1) A write statement must be declared as `kind == "mutation"`. This
+        //    catches the "把写 SQL 误标为 query" case where the normal Run
+        //    button would otherwise execute it unconditionally.
+        // 2) Any `mutation` query requires explicit opt-in via `allow_mutations`.
+        //    This blocks the Editor's unconditional Preview path from running
+        //    mutations without going through a destructive-operation confirmation.
+        let is_mutation_kind = query.kind == "mutation";
+        let is_write = if is_redis { is_redis_write_command(&sql) } else { is_write_sql_for_view(&sql, db_type) };
+        if is_write && !is_mutation_kind {
+            results.push(DataViewQueryResult {
+                query_id: query.id.clone(),
+                title: query.title.clone(),
+                display_mode,
+                result: None,
+                redis_value: None,
+                error: Some(format!(
+                    "Write operation requires mutation kind: query \"{}\" is declared as \"query\" but the SQL contains a write. Mark it as \"mutation\" and confirm before running.",
+                    query.title
+                )),
+            });
+            continue;
+        }
+        if is_mutation_kind && !opts.allow_mutations {
+            results.push(DataViewQueryResult {
+                query_id: query.id.clone(),
+                title: query.title.clone(),
+                display_mode,
+                result: None,
+                redis_value: None,
+                error: Some(format!(
+                    "Mutation \"{}\" requires explicit confirmation. Confirm the destructive operation before execution.",
+                    query.title
+                )),
+            });
+            continue;
+        }
 
         if is_redis {
             let db = query.database.trim().parse::<u32>().unwrap_or(0);
@@ -270,4 +365,106 @@ pub async fn execute_data_view(
     }
 
     ExecuteDataViewResponse { results }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::redis_driver::{classify_command, RedisCommandSafety};
+    use crate::models::connection::DatabaseType;
+
+    #[test]
+    fn is_redis_write_command_classifies_correctly() {
+        assert!(!is_redis_write_command("GET mykey"));
+        assert!(!is_redis_write_command("get mykey"));
+        assert!(!is_redis_write_command("MGET a b"));
+        assert!(!is_redis_write_command("SCAN 0 MATCH *"));
+        assert!(is_redis_write_command("SET mykey value"));
+        assert!(is_redis_write_command("set mykey value"));
+        assert!(is_redis_write_command("DEL mykey"));
+        assert!(is_redis_write_command("del mykey"));
+        assert!(is_redis_write_command("HSET myhash field value"));
+        assert!(is_redis_write_command("FLUSHDB"));
+        assert!(is_redis_write_command("EVAL \"return 1\" 0"));
+        assert!(is_redis_write_command("UNKNOWNCOMMAND foo"));
+        // Quoted form produced by substitute (Redis dialect)
+        assert!(!is_redis_write_command("GET \"my key\""));
+        assert!(is_redis_write_command("SET \"my key\" \"my value\""));
+    }
+
+    #[test]
+    fn is_write_sql_for_view_detects_writes_per_dialect() {
+        assert!(!is_write_sql_for_view("SELECT * FROM users", Some(DatabaseType::Mysql)));
+        assert!(!is_write_sql_for_view("SELECT * FROM users", None));
+        assert!(is_write_sql_for_view("INSERT INTO users VALUES (1)", Some(DatabaseType::Mysql)));
+        assert!(is_write_sql_for_view("INSERT INTO users VALUES (1)", None));
+        assert!(is_write_sql_for_view("UPDATE users SET name = 'x'", Some(DatabaseType::Postgres)));
+        assert!(is_write_sql_for_view("DELETE FROM users", Some(DatabaseType::Sqlite)));
+        // MySQL executable comment is only a write for MySQL
+        let exec = "SELECT 1 /*! INTO OUTFILE '/tmp/probe' */";
+        assert!(is_write_sql_for_view(exec, Some(DatabaseType::Mysql)));
+        assert!(!is_write_sql_for_view(exec, Some(DatabaseType::Postgres)));
+        // Postgres SELECT INTO table creation
+        assert!(is_write_sql_for_view("SELECT * INTO new_table FROM old_table", Some(DatabaseType::Postgres)));
+        assert!(!is_write_sql_for_view("SELECT * INTO new_table FROM old_table", Some(DatabaseType::Sqlite)));
+    }
+
+    #[test]
+    fn redis_classify_matches_helper() {
+        assert_eq!(classify_command("GET"), RedisCommandSafety::Allowed);
+        assert_eq!(classify_command("SET"), RedisCommandSafety::Write);
+        assert_eq!(classify_command("DEL"), RedisCommandSafety::Confirm);
+        assert_eq!(classify_command("FLUSHALL"), RedisCommandSafety::Blocked);
+        // Write helpers must agree on all non-Allowed kinds being considered writes
+        assert!(!is_redis_write_command("GET key"));
+        assert!(is_redis_write_command("DEL key"));
+        assert!(is_redis_write_command("SET key val"));
+        assert!(is_redis_write_command("FLUSHALL"));
+    }
+
+    #[test]
+    fn gate_blocks_write_mislabeled_as_query() {
+        // SQL write with kind=query must be rejected even when allow_mutations is true
+        let err = data_view_gate_error("DELETE FROM users", Some(DatabaseType::Postgres), false, "query", true);
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("Write operation requires mutation kind"));
+
+        // Even with allow=false, same
+        let err2 = data_view_gate_error("DELETE FROM users", Some(DatabaseType::Postgres), false, "query", false);
+        assert!(err2.is_some());
+    }
+
+    #[test]
+    fn gate_blocks_mutation_without_allow() {
+        // Mutation without allow must be rejected even if the SQL is a read (defense-in-depth)
+        let err = data_view_gate_error("SELECT * FROM users", Some(DatabaseType::Postgres), false, "mutation", false);
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("requires explicit confirmation"));
+
+        let err2 = data_view_gate_error("DELETE FROM users", Some(DatabaseType::Postgres), false, "mutation", false);
+        assert!(err2.is_some());
+
+        // With allow, both should pass
+        assert!(data_view_gate_error("SELECT * FROM users", Some(DatabaseType::Postgres), false, "mutation", true)
+            .is_none());
+        assert!(
+            data_view_gate_error("DELETE FROM users", Some(DatabaseType::Postgres), false, "mutation", true).is_none()
+        );
+    }
+
+    #[test]
+    fn gate_allows_read_query() {
+        assert!(
+            data_view_gate_error("SELECT * FROM users", Some(DatabaseType::Postgres), false, "query", false).is_none()
+        );
+        assert!(data_view_gate_error("SELECT * FROM users", None, false, "query", false).is_none());
+    }
+
+    #[test]
+    fn gate_redis_write_detection() {
+        assert!(data_view_gate_error("SET mykey val", Some(DatabaseType::Redis), true, "query", false).is_some());
+        assert!(data_view_gate_error("GET mykey", Some(DatabaseType::Redis), true, "query", false).is_none());
+        assert!(data_view_gate_error("SET mykey val", Some(DatabaseType::Redis), true, "mutation", false).is_some());
+        assert!(data_view_gate_error("SET mykey val", Some(DatabaseType::Redis), true, "mutation", true).is_none());
+    }
 }

@@ -39,13 +39,20 @@ pub async fn execute_data_view_query(
     timeout_secs: Option<u64>,
     client_session_id: Option<String>,
     query_ids: Option<Vec<String>>,
+    allow_mutations: Option<bool>,
 ) -> Result<ExecuteDataViewResponse, String> {
     let view = state.storage.load_data_view(&id).await?.ok_or_else(|| "data view not found".to_string())?;
     let response = execute_data_view(
         &state,
         &view,
         &variables,
-        &DataViewExecuteOptions { max_rows, timeout_secs, client_session_id, query_ids },
+        &DataViewExecuteOptions {
+            max_rows,
+            timeout_secs,
+            client_session_id,
+            query_ids,
+            allow_mutations: allow_mutations.unwrap_or(false),
+        },
     )
     .await;
     Ok(response)

@@ -49,6 +49,8 @@ pub struct ExecuteDataViewRequest {
     pub timeout_secs: Option<u64>,
     pub client_session_id: Option<String>,
     pub query_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_mutations: bool,
 }
 
 pub async fn execute_data_view(
@@ -73,6 +75,7 @@ pub async fn execute_data_view(
             timeout_secs: req.timeout_secs,
             client_session_id: req.client_session_id,
             query_ids: req.query_ids,
+            allow_mutations: req.allow_mutations,
         },
     )
     .await;

@@ -778,6 +778,7 @@ export async function executeDataView(id: string, variables: Record<string, Data
     timeoutSecs: options.timeoutSecs,
     clientSessionId: options.clientSessionId,
     queryIds: options.queryIds,
+    allowMutations: options.allowMutations,
   });
 }
 

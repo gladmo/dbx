@@ -98,4 +98,8 @@ export interface ExecuteDataViewOptions {
   timeoutSecs?: number;
   clientSessionId?: string;
   queryIds?: string[];
+  /** Must be true to execute any query whose `kind === "mutation"`. The Editor's
+   *  single-query Preview passes false for `mutation` rows so the backend rejects
+   *  the call unless the user has confirmed via the danger dialog. */
+  allowMutations?: boolean;
 }

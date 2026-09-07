@@ -322,7 +322,10 @@ async function run() {
   running.value = true;
   startRunTimer();
   try {
-    const response = await store.execute(props.view.id, buildPayload(), { queryIds: readQueries.value.map((q) => q.id) });
+    const response = await store.execute(props.view.id, buildPayload(), {
+      queryIds: readQueries.value.map((q) => q.id),
+      allowMutations: false,
+    });
     results.value = response.results;
   } catch (error) {
     runError.value = error instanceof Error ? error.message : String(error);
@@ -348,7 +351,7 @@ async function executeMutation() {
   pendingMutation.value = null;
   mutationBusy[query.id] = true;
   try {
-    const response = await store.execute(props.view.id, buildPayload(), { queryIds: [query.id] });
+    const response = await store.execute(props.view.id, buildPayload(), { queryIds: [query.id], allowMutations: true });
     const result = response.results.find((r) => r.queryId === query.id);
     if (result) mutationResult[query.id] = result;
   } catch (error) {
